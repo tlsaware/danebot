@@ -1,0 +1,740 @@
+#! /usr/bin/env bash
+# DANE TLSA-safe certbot wrapper
+
+export PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/bin:/sbin
+
+# *BSD systems typically have certbot and the LE data in
+# /usr/local/etc.  Linux in /usr and /etc.
+#
+BOT=$(type -p certbot) || {
+    printf "No certbot executable found on %s\n" "$PATH" >&2
+    exit 1
+    }
+
+# Where's the LE directory?  (Prefer /usr/local/etc)
+#
+TOP=
+ledirs=(/usr/local/etc/letsencrypt /etc/letsencrypt)
+for top in "${ledirs[@]}"
+do
+    if [[ -d "$top" ]]; then TOP="$top"; break; fi
+done
+if [[ -z "$TOP" ]]; then
+    printf "No letsencrypt config directory found, tried: %s\n" \
+        "${ledirs[*]}">&2
+    exit 1
+fi
+
+## --------------
+# CONFIGURATION section
+# These parameters can be overridden by placing new values in /etc/default/danebot
+
+# Key rollover parameters
+KEYALG="rsa"
+KEYOPTS=(rsa_keygen_bits:2048)
+
+# QUESTION: why can't these be read from the current cert as a default?
+
+# Minimum time to wait before assuming that fresh TLSA RRs are globally visible
+# (expired from all remote caches, and updated on all secondary nameservers).
+#
+# This value is passed to find(1) as a "-mtime" option.  The default unit is
+# days.  The FreeBSD version of find(1) supports explicit units ([smhdw]).
+#
+TTL=2
+
+# If the system default OpenSSL CAfile does not include the root CA that issued
+# the LE intermediate CA cert, then you'll need to set the "SSL_CERT_FILE"
+# environment variable to the name of a file with the required root CA certs.
+#
+# export SSL_CERT_FILE=/some/where.pem
+
+# IP address of trusted validating DNS resolver, should not be "too" remote!
+# Needed to check TLSA record presence.  Ideally loopback.  Should we just
+# always use /etc/resolv.conf, even if a distant public server?
+#
+NS=127.0.0.1
+## --------------
+
+# allow replacement configuration by a user
+if [[ -f /etc/default/danebot ]] ; then
+    . /etc/default/danebot
+fi
+
+# Avoid charset issues
+export LANG=C LC_ALL=C LC_CTYPE=C IDN_DISABLE=1
+
+checkpipe() {
+    set -- "${PIPESTATUS[@]}"
+    local ec; for ec; do if [[ "$ec" != 0 ]]; then return 1; fi; done
+}
+
+# Extract various details from a PEM file.
+#
+priv2pem() { openssl pkey -in "$@"; }
+pkey2pub() { openssl pkey -in "$1" -pubout -outform DER; }
+cert2pub() {
+    openssl x509 -in "$1" -noout -pubkey |
+        openssl pkey -pubin -outform DER
+    checkpipe
+}
+creq2pub() {
+    openssl req -in "$1" -noout -pubkey |
+        openssl pkey -pubin -outform DER
+    checkpipe
+}
+chainder() {
+    openssl crl2pkcs7 -nocrl -certfile "$1" |
+	openssl pkcs7 -outform DER
+    checkpipe
+}
+chainpem() {
+    openssl crl2pkcs7 -nocrl -certfile "$1" |
+	openssl pkcs7 -print_certs
+    checkpipe
+}
+
+# Compute hex-encoded digest compatible with the given DANE matching type.
+# Type Full(0) just hex-encodes the input stream.
+#
+digest() {
+    case "$1" in
+    Full|0) cat;;
+    SHA2-256|1) openssl dgst -sha256 -binary;;
+    SHA2-512|2) openssl dgst -sha512 -binary;;
+    *)  printf "invalid matching type: %s\n" "$1" >&2
+        return 1;;
+    esac
+}
+
+# Use xxd or hexdump, falling back on "od".  Output is not
+# newline terminated, which is OK for capture with $(...).
+#
+encode() {
+    if type -p xxd > /dev/null
+    then xxd -p | tr -d '\n'
+    elif type -p hexdump > /dev/null
+    then
+        hexdump -ve '/1 "%02x"'
+    else od -vAn -tx1 | tr -d ' \n'
+    fi
+    checkpipe
+}
+
+# Compute digest of key in SPKI DER form
+#
+pkeyhash() { pkey2pub "$1" | digest "$2" | encode; checkpipe; }
+
+# Compute digest of cert public key in SPKI DER form
+#
+ckeyhash() { cert2pub "$1" | digest "$2" | encode; checkpipe; }
+
+# Compute digest of request public key in SPKI DER form
+#
+rkeyhash() { creq2pub "$1" | digest "$2" | encode; checkpipe; }
+
+# Compute digest of chain certs in PKCS7 DER form
+#
+pkc7hash() { chainder "$1" | digest "$2" | encode; checkpipe; }
+
+# Return a pair of digests for the private key and full chain.
+#
+combohashes() {
+    ckeyhash "$1" SHA2-512 || return 1
+    pkc7hash "$1" SHA2-512 || return 1
+}
+
+# Verify a chain file against the system default trust store
+verify() {
+    case $# in
+        1) nameopt="";;
+        2) nameopt="-verify_hostname=$2";;
+        *) return 1;;
+    esac
+    openssl verify -untrusted "$1" -verify_depth 2 $nameopt "$1" >/dev/null
+}
+
+# Return the mtype and data of resolver validated "3 1 X ..." TLSA records of a
+# given owner domain (possibly CNAME resolved).  Tolerate iterative resolvers
+# are authoritative for the containing zone and return the "aa" bit instead of
+# the "ad" bit.
+#
+gettlsa() {
+    perl - "$@" <<'EOF'
+        use strict;
+        use warnings;
+        use Net::DNS::Resolver;
+        use Net::DNS::Packet;
+        use Net::DNS::Header;
+        use Net::DNS::RR;
+        use Net::DNS::RR::TLSA;
+
+        die "usage: $0 <owner> NS [...]\n" unless (@ARGV > 1);
+        (my $owner = lc(shift(@ARGV))) =~ s/\.*$//;
+        my $resolver = Net::DNS::Resolver->new(
+            nameservers => [ @ARGV ], recurse => 1, defnames => 0, adflag => 1);
+        my $reply = $resolver->query( $owner, q{TLSA} );
+        die sprintf("Error resolving %s TLSA ? via: %s\n", $owner, join(", ", @ARGV))
+            unless (defined($reply) && $reply->header->rcode() eq q{NOERROR});
+        die sprintf("Insecure reply for %s TLSA ? via: %s\n", $owner, join(", ", @ARGV))
+            unless ($reply->header->ad() || $reply->header->aa());
+        my $rrs;
+        for ($reply->answer) {
+            my $o = lc($_->owner);
+            ($rrs->{$o} //= {})->{$_->type} //= [];
+            push @{$rrs->{$o}->{$_->type}}, $_;
+        }
+        for my $r (@{answers($owner, $rrs)}) {
+            printf "%d %d %d %s\n",
+                $r->usage, $r->selector,
+                $r->matchingtype, lc($r->cert);
+        }
+        sub answers {
+            my ($o, $rrs) = @_;
+            my $ret = $rrs->{$o}->{q{TLSA}};
+            return $ret if defined($ret);
+            $ret = delete $rrs->{$o}->{q{CNAME}};
+            return [] unless defined($ret) && @$ret == 1;
+            return answers(lc($ret->[0]->cname), $rrs);
+        }
+EOF
+}
+
+# Check whether a candidate private key is ready to be deployed.
+#
+keyready() {
+    local l=$1 kt=$2 kf=$3
+    local d="staging/$l"
+    local rrs="$d/dane-ee"
+    local miss="lineage: %s, %s key: %s, missing TLSA RR: %s. IN TLSA 3 1 %d %s"
+    local mtype owner dgst hash dnsrrs ready found fmt
+    local tu ts tm td
+
+    # Nothing to do if there's no next key.  Otherwise, check key format.
+    #
+    if [[ ! -f "$kf" ]]; then return 0; fi
+    priv2pem "$kf" -noout || {
+        printf -- "Malformed %s key %s for lineage: %s\n" \
+            "$kt" "$kf" "$l" >&2
+        return 1
+        }
+
+    # Accept key as ready if there are no expected TLSA RRs
+    #
+    if [[ ! -f "$rrs" || ! -s "$rrs" ]]; then return 0; fi
+
+    ready=1
+    while read mtype owner
+    do
+        hash=$(pkeyhash "$kf" "$mtype") || return 1
+        dnsrrs=$(gettlsa "$owner" $NS) || return 1
+        set -- $dnsrrs
+        found=0
+        while [[ $# > 3 ]]
+        do
+            tu=$1; shift
+            ts=$1; shift
+            tm=$1; shift
+            td=$1; shift
+            if [[ "$tu" != 3 ]]; then continue; fi
+            if [[ "$ts" != 1 ]]; then continue; fi
+            if [[ "$tm" != "$mtype" ]]; then continue; fi
+            if [[ "$td" != "$hash" ]]; then continue; fi
+            found=1
+            break
+        done
+        if [[ "$found" == 0 ]]
+        then
+            printf "WARNING: $miss"'\n' \
+                "$l" "$kt" "$kf" "$owner" "$mtype" "$hash" >&2
+            ready=0
+        fi
+    done < "$rrs"
+
+    [[ $ready == 1 ]]
+}
+
+# Parse archive link($1) into (directory, serial, serial+1) triple ($2)
+#
+linkvno() {
+    local -n ret=$2
+    local link dir serial
+
+    link=$(readlink "$1") || return 1
+    ret[dir]=$(dirname "$link")
+    ret[ver]=$(basename "$link" .pem | sed 's/.*[^0-9]\([0-9][0-9]*\)$/\1/')
+    # Sanity check
+    printf "%s\n" "${ret[ver]}" | grep -q '^[0-9][0-9]*$' || return 1
+    ret[nxt]=$(( "${ret[ver]}" + 1 ))
+}
+
+# Rotate private key unless requisite TLSA RRs have not yet been in place
+# sufficiently long.
+#
+keyrot() {
+    local l=$1
+    local d="staging/$l"
+    local next="$d/nextkey.pem"
+    local ready="ready.pem"
+    local info="lineage: %s, ready key: %s is too fresh, delaying deployment"
+
+    # If we don't yet have a ready to roll new key, check whether the next
+    # candidate meets all prerequisites.
+    #
+    if [[ ! -f "$d/$ready" && -f "$next" ]]
+    then
+        if keyready "$l" "next" "$next"
+        then
+            touch "$next"
+            mv "$next" "$d/$ready"
+        fi
+    fi
+
+    if [[ ! -f "$d/$ready" ]]; then return 0; fi
+
+    # XXX: We just check a fixed publication time, without actually checking
+    # all secondary nameservers.
+    #
+    cool=$(find "$d/$ready" -type f -mtime +$TTL -print -o -prune) || return 1
+
+    # If there's no ready key, or it is too fresh, wait...
+    #
+    if [[ -z "$cool" ]]; then
+        printf "INFO: $info\n%s %s\n" "$l" "$d/$ready" >&2
+        return 0
+    fi
+
+    # Stage the new key by updating the privkey symlink to point to the next
+    # serial number in the archive with that key for contents.
+    (
+        cd $d
+        declare -A lnk; linkvno "fullchain.pem" lnk || exit 1
+        nkey="${lnk[dir]}/privkey${lnk[nxt]}.pem"
+        rsync -a "$ready" "$nkey" || exit 1
+        ln -sf "$nkey" privkey.pem || exit 1
+    ) || return 1
+
+    return 2
+}
+
+# Run this in a subshell to avoid premature exit
+#
+freshen() {
+    local l=$1
+    local d="staging/$l"
+    local ready="ready.pem"
+    local fqdn ec link kver cver
+    local -A cert pkey
+
+    # Optionally rotate the private key, ignore errors, just stay with
+    # the current key.
+    #
+    keyrot "$l"
+
+    case $? in
+        0) force="";;
+        2) force="--force-renewal";;
+        *) exit 1;;
+    esac
+
+    # Run certbot to renew a cert when near expiration.  This
+    # may use the new key.
+    #
+    $BOT -q $force --cert-name "$l" renew --reuse-key; ec=$?
+
+    linkvno "$d/fullchain.pem" cert || exit 1
+    linkvno "$d/privkey.pem" pkey || exit 1
+
+    # Resync key version with cert version in case of failure
+    (
+        cd $d
+
+        # Done if chain serial == key serial
+        if [[ "${cert[ver]}" == "${pkey[ver]}" ]]
+        then
+            # Rekey successful, drop "ready.pem"
+            #
+            if [[ -n "$force" ]]; then /bin/rm -f "$ready"; fi
+            exit 0
+        fi
+
+        # Restore key serial to chain serial
+        ln -sf "${pkey[dir]}/privkey${cert[ver]}.pem" privkey.pem || exit 1
+
+        # Delete archived next key if unused chain's successor
+        if [[ "${pkey[ver]}" == "${cert[nxt]}" ]]
+        then
+            /bin/rm -f "${pkey[dir]}/privkey${pkey[ver]}.pem"
+        fi
+    ) || exit 1
+
+    # Capture the key and full chain into a single mode 0600 file
+    #
+    kver="$d/${pkey[dir]}/privkey${pkey[ver]}.pem"
+    cver="$d/${cert[dir]}/fullchain${cert[ver]}.pem"
+    combo=$(mktemp $d/combo.pem.XXXXXX)
+    trap '/bin/rm -f "$combo"; exit 1' EXIT HUP INT QUIT TERM
+    #
+    priv2pem "$kver" >> "$combo"
+    checkpipe || {
+        printf "Error reading private key: %s\n" "$kver" >&2
+        exit 1
+        }
+    chainpem "$cver" >> "$combo"
+    checkpipe || {
+        printf "Error reading certificate chain: %s\n" "$cver" >&2
+        exit 1
+        }
+
+    # Check that the combo EE certificate and private key match
+    #
+    cert312=$(ckeyhash "$combo" SHA2-256) || exit 1
+    pkey312=$(pkeyhash "$combo" SHA2-256) || exit 1
+    if [[ "$cert312" != "$pkey312" ]]; then
+        printf "key/cert mismatch for lineage: %s\n" "$l" >&2
+        exit 1
+    fi
+
+    # Verify the new certificate chain, also checking any required DNS names
+    #
+    if [[ -f "$d/dnsnames" && -s "$d/dnsnames" ]]; then
+        while read fqdn
+        do
+            verify "$combo" "$fqdn" >/dev/null
+            checkpipe || {
+                printf "cert verification failure for lineage: %s, hostname=%s\n" \
+                    "$l" "$fqdn" >&2
+                exit 1
+                }
+        done < "$d/dnsnames"
+    else
+        verify "$combo" >/dev/null
+        checkpipe || {
+            printf "cert verification failure for lineage: %s\n" "$l" >&2
+            exit 1
+            }
+    fi
+
+    # If key and chain combo same as before, just use the old file
+    #
+    move=1
+    if [[ -f "$d/combo.pem" ]]; then
+        old=$(combohashes "$d/combo.pem") || exit 1
+        new=$(combohashes "$combo") || exit 1
+        if [[ "$old" == "$new" ]]; then move=0; fi
+    fi
+
+    if [[ "$move" == 0 ]]; then
+        /bin/rm -f "$combo"
+    else
+        mv "$combo" "$d/combo.pem"
+        checkpipe || {
+            printf "error staging combo key+chain for lineage: %s\n" "$l" >&2
+            exit 1
+            }
+    fi
+    trap - EXIT HUP INT QUIT TERM
+
+    # Deploy the latest "combo.pem" file
+    #
+    rsync -a "$d/combo.pem" "live/$l/combo.pem"
+    checkpipe || {
+        printf "error deploying combo key+chain for lineage: %s\n" "$l" >&2
+        exit 1
+    }
+
+    # Also the normal certbot links, sadly non-atomic
+    local -A p
+    for pem in privkey fullchain cert chain
+    do
+        if linkvno "live/$l/$pem.pem" p && \
+           [[ "${p[dir]}" == "../../archive/$l" && \
+              "${p[ver]}" == "${cert[ver]}" ]]
+        then
+            continue
+        fi
+        ln -sf "../../archive/$l/$pem${cert[ver]}.pem" "live/$l/$pem.pem" || exit 1
+    done
+}
+
+# Generate a new key, this will be renamed to "ready.pem" once all the required
+# TLSA "3 1 x" TLSA records based on the content of the 'dane-e' configuration
+# file are present.  Once the "ready.pem" file is old enough, it will be used
+# for the subsequent cert renewal (which will be forced, even if the current
+# certificate is not near expiration).
+#
+rollover() {
+    local cmd="$1"
+    local lineage="$2"
+    local cmd tmpkey opt
+
+    if [[ -z "$lineage" ]]; then
+        printf "Usage: %s %s <lineage>\n" "$0" "$cmd" 2>&1
+        exit 1
+    fi
+    if [[ ! -f "renewal/$lineage.conf" ]]; then
+        printf "Error: lineage '%s' has no renewal/%s.conf file\n" \
+            "$lineage" "$lineage" 2>&1
+        exit 1
+    fi
+
+    if [[ ! -d "staging/$lineage" ]]; then
+        printf "Error: lineage '%s' has no staging/%s directory\n" \
+            "$lineage" "$lineage" 2>&1
+        exit 1
+    fi
+    cd staging/$lineage || exit 1
+
+    if [[ ! -h fullchain.pem || ! -h privkey.pem ]]; then
+        printf "Error: lineage '%s' has an incomplete staging chain\n" \
+            "$lineage" 2>&1
+        exit 1
+    fi
+
+    for k in nextkey.pem ready.pem
+    do
+        if [[ -f "$k" ]]; then
+            printf "Error: lineage '%s' already has a staged key in %s\n" \
+                "$lineage" "$k" 2>&1
+            exit 1
+        fi
+    done
+
+    tmpkey=$(mktemp nextkey.pem.XXXXXX) || exit 1
+    trap '/bin/rm -f "$tmpkey"; exit 1' EXIT HUP INT QUIT TERM
+    cmd=(genpkey -out "$tmpkey" -algorithm "$KEYALG")
+    for opt in "${KEYOPTS[@]}"
+    do
+        cmd=("${cmd[@]}" -pkeyopt "$opt")
+    done
+    openssl "${cmd[@]}" 2>/dev/null || {
+        printf "Error: key generation failed\n" >&2
+        exit 1
+        }
+
+    ln "$tmpkey" nextkey.pem || {
+        printf "Error: failed to link new key to nextkey.pem\n" >&2
+        /bin/rm -f "$tmpkey"
+        exit 1
+        }
+    /bin/rm -f "$tmpkey"
+    trap - EXIT HUP INT QUIT TERM
+
+    if [[ -s dane-ee ]]; then
+        printf "The new key has been staged, but is not ready for use in cert renewal\n"
+        printf "The below TLSA RRS need to be added to the RRs matching the current keys:\n"
+        while read mtype owner
+        do
+            hash=$(pkeyhash "nextkey.pem" "$mtype") || exit 1
+            printf "%s. IN TLSA 3 1 %d %s\n" "$owner" "$mtype" "$hash"
+        done < "dane-ee"
+    else
+        hash=$(pkeyhash "nextkey.pem" 1) || exit 1
+        if [[ -n "$hash" ]]; then
+            printf "Suggested TLSA RDATA: 3 1 1 %s\n" "$hash"
+        fi
+    fi
+    exit 0
+}
+
+renew_certs() {
+    local c l
+
+    rc=0
+    for conf in renewal/*.conf
+    do
+        l=$(basename "$conf" .conf)
+        if [[ -d "staging/$l" ]]
+        then
+            ( freshen "$l" ) || {
+                printf "Warning: unable to freshen %s\n" "$l" >&2
+                rc=1
+                }
+        elif [[ -d "archive/$l" ]]; then
+            $BOT -q --cert-name "$l" renew || rc=1
+        fi
+    done
+    exit $rc
+}
+
+init_staging() {
+    local d l lineages=()
+    local pemdir pemver
+
+    if [[ $# == 0 ]]; then
+        for d in live/*
+        do
+            l=$(basename "$d")
+            if [[ ! -d "$d" || ! -f "renewal/$l.conf" ]]
+            then
+                continue
+            fi
+            lineages=( "${lineages[@]}" "$l" )
+        done
+    else
+        for l in "$@"
+        do
+            if [[ ! -d "live/$l" || ! -f "renewal/$l.conf" ]]
+            then
+                continue
+            fi
+            lineages=( "${lineages[@]}" "$l" )
+        done
+    fi
+
+    err=0
+    for l in "${lineages[@]}"
+    do
+        if [[ -d "staging/$l" ]]
+        then
+            ( printf "Staging directory for lineage %s already exists, " "$l"
+              printf "automatic initialisation is unsafe. "
+              printf "If you're sure it is not in use, "
+              printf "delete it, and retry.\n" ) | fmt >&2
+            exit 1
+        fi
+
+        printf "Creating staging directory for lineage '%s'...\n" "$l">&2
+        mkdir -p staging || exit 1
+        rsync -a "live/$l/" "staging/$l/" || exit 1
+        (
+            cnf="staging/$l/tmp.conf"
+            rsync -a "renewal/$l.conf" "$cnf" || exit 1
+            perl -i -lne '
+                BEGIN { our ($top, $l) = splice(@ARGV, 0, 2); }
+                if (m{^\[renewalparams\]\s*$}) {
+                    print; print "reuse_key = True";
+                    next;
+                }
+                next if (m{^reuse_key\s*=});
+                if (m{^(\w+)\s*=\s*\Q$top\E/live/\Q$l\E(/.*|)\s*$}o) {
+                    print "$1 = $top/staging/$l$2";
+                    next;
+                }
+                print;
+            ' "$TOP" "$l" "$cnf" || exit 1
+            ln -f "renewal/$l.conf" "renewal/$l.conf.orig" || exit 1
+            rsync -a "$cnf" "renewal/$l.conf" || exit 1
+            /bin/rm -f "$cnf" || :
+            newcnf="renewal/$l.conf"
+            printf "\tOriginal '%s' saved as '%s.orig'\n" "$newcnf" "$newcnf"
+            printf "\tChanges made to '%s':\n\n" "$newcnf"
+            diff -U0 "$newcnf.orig" "$newcnf" || :
+
+            kf="staging/$l/privkey.pem"
+            if [[ -f "$kf" ]]; then
+                hash=$(pkeyhash "$kf" 1)
+                if [[ -n "$hash" ]]; then
+                    printf "\nSuggested TLSA RDATA: 3 1 1 %s\n" "$hash"
+                fi
+            fi
+        ) || {
+            printf "Initialisation of lineage '%s' failed, removing newly created staging directory\n" "$l">&2
+            /bin/rm -rf "staging/$l"
+            err=1
+        }
+    done
+    exit $err
+}
+
+deinit_staging() {
+    local d l lineages=()
+    local pemdir pemver
+
+    if [[ $# == 0 ]]; then
+        if [[ ! -d staging ]]; then
+            printf "No staging lineages found.  Nothing to do.\n"
+            return 0
+        fi
+        for d in staging/*
+        do
+            l=$(basename "$d")
+            if [[ ! -d "$d" || ! -f "renewal/$l.conf" ]]
+            then
+                continue
+            fi
+            lineages=( "${lineages[@]}" "$l" )
+        done
+    else
+        for l in "$@"
+        do
+            if [[ ! -d "staging/$l" || ! -f "renewal/$l.conf" ]]
+            then
+                printf "WARNING: ignoring unstaged lineage '%s'\n" "$l"
+                continue
+            fi
+            lineages=( "${lineages[@]}" "$l" )
+        done
+    fi
+
+    err=0
+    for l in "${lineages[@]}"
+    do
+        printf "Reverting staging for lineage '%s'...\n" "$l">&2
+        printf "Once this is done, update any applicable configuration files "
+        printf "to use 'fullchain.pem' and 'privkey.pem' instead of 'combo.pem'\n"
+        printf "Note: the 'reuse_key' setting will remain set to true\n"
+
+        (
+            # Update archive files and live PEM links
+            declare -A p
+            for pem in fullchain chain cert privkey
+            do
+                linkvno "staging/$l/$pem.pem" p || exit 1
+                if [[ "${p[dir]}" != "../../archive/$l" ]]; then
+                    rsync -aL "staging/$l/$pem.pem" "archive/$l/$pem${p[ver]}.pem" || exit 1
+                fi
+                ln -sf "../../archive/$l/$pem${p[ver]}.pem" "live/$l/$pem.pem" || exit 1
+            done
+
+            # Keep some danebot state
+            for f in dane-ee dnsnames
+            do
+                if [[ -f "staging/$l/$f" ]]; then
+                    rsync -a "staging/$l/$f" "live/$l/$f"
+                fi
+            done
+
+            # Restore default config paths
+            cnf="staging/$l/.tmp.conf"
+            /bin/rm -f "$cnf"
+            rsync -a "renewal/$l.conf" "$cnf" || exit 1
+            perl -i -lne '
+                BEGIN { our ($top, $l) = splice(@ARGV, 0, 2); }
+                if (m{^(\w+)\s*=\s*\Q$top\E/staging/\Q$l\E(/.*|)\s*$}o) {
+                    if ($1 ne "archive_dir") {
+                        print "$1 = $top/live/$l$2";
+                    } else {
+                        print "$1 = $top/archive/$l";
+                    }
+                    next;
+                }
+                print;
+            ' "$TOP" "$l" "$cnf" || exit 1
+            newcnf="renewal/$l.conf"
+            ln -f "$newcnf" "$newcnf.orig" || exit 1
+            rsync -a "$cnf" "$newcnf" || exit 1
+
+            printf "\tOriginal '%s' saved as '%s.orig'\n" "$newcnf" "$newcnf"
+            printf "\tChanges made to '%s':\n\n" "$newcnf"
+            diff -U0 "$newcnf.orig" "$newcnf" || :
+
+            /bin/rm -rf "staging/$l" || :
+            rmdir staging 2>/dev/null || :
+        ) || {
+            printf "ERROR: De-initialisation of lineage '%s' failed\n" "$l">&2
+            exit 1
+        }
+    done
+    exit $err
+}
+
+cd "$TOP" || exit 1
+case "$1" in
+    init)   ( shift; init_staging "$@"); exit $? ;;
+    deinit) ( shift; deinit_staging "$@" ); exit $? ;;
+    renew)  ( renew_certs ); exit $? ;;
+    newkey) ( rollover "$@" ); exit $? ;;
+    *|help) printf "usage: %s <action> [<lineage> ...] | help\n\twhere <action> is one of: init, renew, newkey or deinit\n" "$0">&2
+            [[ $1 = "help" ]];;
+esac

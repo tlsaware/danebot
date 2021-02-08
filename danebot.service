@@ -1,0 +1,9 @@
+[Unit]
+Description=DANE-compable certbot wrapper
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/danebot renew
+
+[Install]
+WantedBy=multi-user.target

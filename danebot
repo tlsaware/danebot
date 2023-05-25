@@ -85,12 +85,12 @@ creq2pub() {
 }
 chainder() {
     openssl crl2pkcs7 -nocrl -certfile "$1" |
-	openssl pkcs7 -outform DER
+    openssl pkcs7 -outform DER
     checkpipe
 }
 chainpem() {
     openssl crl2pkcs7 -nocrl -certfile "$1" |
-	openssl pkcs7 -print_certs
+    openssl pkcs7 -print_certs
     checkpipe
 }
 
@@ -458,7 +458,7 @@ freshen() {
 }
 
 # Generate a new key, this will be renamed to "ready.pem" once all the required
-# TLSA "3 1 x" TLSA records based on the content of the 'dane-e' configuration
+# TLSA "3 1 x" TLSA records based on the content of the 'dane-ee' configuration
 # file are present.  Once the "ready.pem" file is old enough, it will be used
 # for the subsequent cert renewal (which will be forced, even if the current
 # certificate is not near expiration).

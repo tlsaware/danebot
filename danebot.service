@@ -1,5 +1,5 @@
 [Unit]
-Description=DANE-compable certbot wrapper
+Description=DANE-compatible certbot wrapper
 
 [Service]
 Type=oneshot

@@ -1,0 +1,33 @@
+# /etc/default/danebot - DANE TLSA-safe certbot wrapper
+# This is bash source.
+
+# Key rollover parameters
+
+KEYALG="rsa"
+# KEYOPTS is an array of "-pkeyopt" option values applicable with the
+# $KEYALG algorithm.  See the OpenSSL genpkey(1) manpage for details.
+KEYOPTS=(rsa_keygen_bits:2048)
+
+# [OpenSSL 1.1.1](https://www.openssl.org/docs/man1.1.1/man1/genpkey.html)
+# [OpenSSL 3.0](https://www.openssl.org/docs/man3.0/man1/genpkey.html)
+
+# Minimum time to wait before assuming that fresh TLSA RRs are globally visible
+# (expired from all remote caches, and updated on all secondary nameservers).
+#
+# This value is passed to find(1) as a "-mtime" option.  The default unit is
+# days.  The FreeBSD version of find(1) supports explicit units ([smhdw]).
+
+TTL=2
+
+# If the system default OpenSSL CAfile does not include the root CA that issued
+# the LE intermediate CA cert, then you'll need to set the "SSL_CERT_FILE"
+# environment variable to the name of a file with the required root CA certs.
+
+# export SSL_CERT_FILE=/some/where.pem
+
+# IP address of trusted validating DNS resolver, should not be "too" remote!
+# Needed to check TLSA record presence.  Ideally loopback.  Should we just
+# always use /etc/resolv.conf, even if a distant public server?
+
+NS=127.0.0.1
+

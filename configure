@@ -1,0 +1,76 @@
+#!/bin/sh
+
+# DANE TLSA-safe certbot wrapper
+
+# configure - Adjust Makefile to suit the local system
+
+# Check that no arguments were passed (not that kind of ./configure)
+
+if [ $# != 0 ]
+then
+    echo "This configure script doesn't take any arguments" >&2
+    exit 1
+fi
+
+# Some helper functions
+
+enable()
+{
+    macro="$1"
+    target="$2"
+    # Uncomment a target macro in Makefile
+    perl -pi -e "s,^#($macro = $target)$,\1," Makefile
+}
+
+setdir()
+{
+    macro="$1"
+    dir="$2"
+    # Change the value of a directory macro in Makefile
+    perl -pi -e "s,^(\s*$macro\s*=\s*).*$,\1$dir," Makefile
+}
+
+configdir()
+{
+    macro="$1"; shift
+    done=0
+    for dir in "$@"
+    do
+        if [ -d "$dir" ]
+        then
+            setdir "$macro" "$dir"
+            done=1
+            break
+        fi
+    done
+    [ $done = 0 ] && echo "Unknown directory for $macro (Adjust Makefile manually)" >&2
+}
+
+# Set $(bindir), $(cfgdir), $(mandir) - prefer local to system locations
+
+configdir bindir /usr/local/bin /opt/local/bin /usr/pkg/bin /usr/bin
+configdir cfgdir /usr/local/etc /opt/local/etc /usr/pkg/etc /etc/default /etc/defaults
+configdir mandir /usr/local/share/man /usr/local/man /opt/local/share/man /usr/pkg/man /usr/share/man /usr/man
+
+# Include systemd or cron in install/uninstall and set $(crondir)
+
+if [ -d /lib/systemd/system ]
+then
+    enable install_extra install-systemd
+    enable uninstall_extra uninstall-systemd
+else
+    cronned=0
+    for etc in /etc /usr/local/etc /opt/local/etc /usr/pkg/etc
+    do
+        if [ -d $etc/cron.weekly ]
+        then
+            setdir crondir $etc/cron.weekly
+            enable install_extra install-cronjob
+            enable uninstall_extra uninstall-cronjob
+            cronned=1
+            break
+        fi
+    done
+    [ $cronned = 1 ] || echo "Error: No systemd or anacron found (Install cronjob manually)" >&2
+fi
+

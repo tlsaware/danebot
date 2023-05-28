@@ -1,0 +1,112 @@
+# INSTALL
+
+There is a ./configure script but it takes no arguments.
+It just adjusts the Makefile to install into directories
+that exist on the local system, and to include the installation
+of a systemd service and timer on systems that have systemd,
+or to include the installation of an anacron weekly cronjob
+on other systems (if they have anacron).
+
+The Makefile can instead (or subsequently) be adjusted manually.
+
+The Makefile has several install/uninstall targets:
+
+        The following make targets are available:
+
+          help              - Show this information (default target)
+          check             - Check the local system for prerequisites
+          install           - Same as install-bin + install-cfg + install-man
+          install-bin       - Install /usr/local/bin/danebot
+          install-cfg       - Install /etc/default/danebot
+          install-man       - Install /usr/local/share/man/man1/danebot.1
+          install-systemd   - Install /lib/systemd/system/danebot.service, /lib/systemd/system/danebot.timer
+          install-cronjob   - Install /etc/cron.weekly/danebot
+          uninstall         - Same as uninstall-bin + uninstall-man
+          uninstall-bin     - Uninstall /usr/local/bin/danebot
+          uninstall-cfg     - Uninstall /etc/default/danebot
+          uninstall-man     - Uninstall /usr/local/share/man/man1/danebot.1
+          uninstall-systemd - Uninstall /lib/systemd/system/danebot.service, /lib/systemd/system/danebot.timer
+          uninstall-cronjob - Uninstall /etc/cron.weekly/danebot
+          systemd-enable    - Enable and start the systemd timer
+          systemd-disable   - Disable the systemd timer
+          purge             - Same as uninstall + uninstall-cfg
+          man               - Create ./danebot.1
+          clean             - Delete ./danebot.1
+          ls                - Run ls -l for all installed files
+
+        Before installing, read INSTALL for more details.
+        After installing, read "man danebot" for more details.
+
+To install danebot:
+
+        ./configure
+        make check
+        make install
+
+On systems with systemd, you will also need to enable and start the danebot
+timer. To do this, first stop and disable the certbot timer, if necessary:
+
+        systemctl stop certbot.timer
+        systemctl disable certbot.timer
+
+Then enable and start the danebot timer:
+
+        make systemd-enable
+        # or
+        systemctl enable danebot.time
+        systemctl start danebot.timer
+
+On systems without systemd, but with anacron, "make install" will install
+a weekly cronjob that is automatically enabled.
+
+On systems with neither, you have to install a weekly-ish cronjob manually.
+It should look something like this:
+
+        0 0 * * 0 danebot renew
+
+Danebot can be uninstalled with:
+
+        make uninstall
+
+This will automatically stop and disable the systemd timer, if necessary, or
+remove the anacron weekly cronjob, if necessary, but it won't remove a
+manually added cronjob. You would need to remove it manually as well.
+
+It also won't uninstall the /etc/default/danebot (or similar) configuration
+file, which you might have modified. To do that as well:
+
+        make purge
+
+If you had to manually add a cronjob, you'll have to remove it manually as
+well.
+
+# REQUIREMENTS
+
+Danebot requires the following programs:
+
+        bash, certbot, perl, openssl, rsync, readlink, dirname, basename,
+        find, mktemp, diff, xxd or hexdump
+
+In addition, installing danebot requires:
+
+        make, pod2man
+
+Some of these are standard. Others will need to be installed via
+the local system's package management system if they are not already
+present.
+
+Danebot also requires the following perl modules:
+
+        Net::DNS::Resolver
+        Net::DNS::Packet
+        Net::DNS::Header
+        Net::DNS::RR
+        Net::DNS::RR::TLSA
+
+These can all be installed with:
+
+        cpan Net::DNS
+
+But your local system might have a package for this instead
+(e.g., libnet-dns-perl on Debian).
+

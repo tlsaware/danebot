@@ -1,0 +1,286 @@
+=head1 NAME
+
+I<danebot> - DANE TLSA-safe certbot wrapper
+
+=head1 SYNOPSIS
+
+ usage: danebot [command] [args...]
+ commands:
+  help                - Show a usage message
+  init [lineage...]   - Convert existing lineages to danebot usage
+  deinit [lineage...] - Restore lineages to certbot control
+  renew               - Renew certificates (weekly)
+  newkey [lineage...] - Rollover the private key(s)
+
+=head1 DESCRIPTION
+
+C<danebot> is a C<certbot> wrapper that helps to avoid SMTP outages
+due to mismatched TLSA records resulting from a Let's Encrypt
+automated certificate renewal.
+
+Specifically, C<danebot> is a shell script that is a small wrapper
+around C<certbot> that:
+
+=over 4
+
+=item 1
+
+Calls C<certbot> as needed to do automated certificate updates, just like
+C<certbot> does.
+
+=item 2
+
+Keeps TLSA records stable by reusing the current public/private key pair for
+certificate renewals rather than creating new keys.
+
+=item 3
+
+Supports key rollover when desired by ensuring that matching TLSA records
+are already published before switching to a new key pair.
+
+=item 4
+
+Supports multiple C<certbot> I<lineages> (renewable certificates -- see the
+[certbot documentation]).
+
+=item 5
+
+Some of the lineages can be simple pass-throughs to C<certbot>.  For these
+lineages, C<danebot> does not manage key rollover to ensure matching TLSA
+records.
+
+=back
+
+L<[certbot documentation]|https://eff-certbot.readthedocs.io/en/stable/what.html>
+
+=head2 Important note:
+
+You B<must> use C<danebot> in place of C<certbot> -- Specifically,
+disable or replace the cron or other process that invokes C<certbot>
+and instead use C<danebot> exclusively.
+
+=head1 USAGE
+
+=head2 Initialization
+
+=over 4
+
+=item 1
+
+Use C<certbot> to create and initialise any certificate I<lineages> you want
+managed on your system.  (Changing the list of DNS names covered by a certificate
+lineage is not yet supported by C<danebot>, you can run C<certbot> interactively to
+do that).
+
+=item 2
+
+Run C<danebot init> so it can find and start managing C<certbot>'s
+certificates.  If you manage more than one certificate I<lineage>,
+you can specify a list of lineage names to convert to C<danebot>.
+
+=back
+
+=head2 Certificate update automation
+
+Pick whether you want to call C<danebot> from systemd or cron.  Either
+way, make sure you disable any C<certbot renew> cron or other scripts.
+
+=head3 Using systemd integration
+
+For C<systemd>, install C<danebot.service> and C<danebot.timer> in
+C</lib/systemd/system/> with C<make install-systemd>, and enable them.
+
+=head3 Using cron
+
+=over 4
+
+=item 1
+
+Run C<danebot renew> in a weekly-ish cron job.  It will continue to
+reuse your existing private key for your certificates (see
+below for rolling your keys).
+   
+=item 2
+
+While C<certbot> hooks are already non-reliable (don't retry later
+on failure to complete, ...), they're even more so a poor fit with
+C<danebot>, because when managed by C<danebot>, C<certbot> only puts the new
+certificate in a staging directory, which is post-processed by C<danebot>.
+
+When C<certbot> hooks run, the new certificate chain is not yet deployed.
+Therefore, you'll need to run additional commands after C<danebot> is done,
+that check for recent changes in the "live" certificate files, and
+take appropriate actions.
+
+=back
+
+=head2 Rolling your private key to a new key using danebot
+
+To have C<danebot> start the process of rolling a given I<lineage> to a new
+private PKIX key:
+ 
+=over 4
+
+=item 1
+
+Create a C<dane-ee> file in the C</etc/letsencrypt/staging/>I<lineage> directory.
+This file must list one line per monitored TLSA record set.  Each line has
+two fields, a DANE matching type and a DNS FQDN where the TLSA record is
+expected to be found.  Example:
+
+ 1 _25._tcp.smtp.acme.example
+
+With this setting, new keys will only be used once a matching C<S<3 1 1>>
+TLSA record is published for C<_25._tcp.smtp.acme.example>.  If your
+certificate covers multiple logical MTA names, add a line(s) for each.  A
+recommended best practice is to use a single MX hostname for multiple
+domains to keep the TLSA count low, rather than creating a separate I<MX>
+name for each domain.
+
+You can also require that the Let's Encrypt issued certificate have a set of
+expected DNS names by creating a C<dnsnames> file in the same
+I<lineage>-specific C<staging> directory.  List one DNS name per line.  New
+certificates will only be made "live" when all the required names are present.
+
+=item 2
+
+Run C<danebot newkey> I<lineage> by hand.  You must specify exactly one
+I<lineage> name.  This will create the new key but will not start using it
+yet.  Instead, it will output a new C<TLSA> record that you should B<add> to
+(not replace) all the associated C<_port._tcp.server.example> DNS RRsets
+(typically just one when the certificate covers just one hostname).  B<Do
+not remove the TLSA records matching the original key just yet, as the
+certificate is still using the old key.>
+
+=item 3
+
+Continue running the C<danebot renew> cron job as before.  C<danebot> will
+monitor for the appearance of the expected C<TLSA> records and wait at
+least 2 more days before calling C<certbot> to switch to using the new key
+for creating certificates.
+
+=item 4
+
+After C<danebot> switches to the new key, you can remove the older TLSA
+records from DNS (making sure to remove the old and not the new ones).
+
+=back
+
+=head1 HOW IT WORKS
+
+Under the hood, C<danebot> creates lineage-specific C<staging> sub-directories
+named C</etc/letsencrypt/staging/>I<lineage-name>.  Certificates and keys
+generated by C<certbot> are only copied to the C<live> directory after basic
+validation.
+
+An extra feature of C<danebot>: for applications that support atomically
+loading both the private key and the certificate chain from the same
+file, C<danebot> also atomically updates a C<combo.pem> file in the
+lineage-specific C<live> directory.  The C<combo.pem> file will contain
+the private key followed by the certificate chain with the leaf
+certificate before the rest of the chain.  If you decide to disable
+C<danebot> and go back to C<certbot>, don't forget to go back to using
+C<privkey.pem> and C<fullchain.pem>, as C<certbot> will not update
+C<combo.pem>.
+
+By default C<danebot> keeps the underlying public/private key pair fixed
+across certificate updates, allowing the extant TLSA records, either or
+both of:
+
+=over 4
+
+=item * 3 1 1: i.e. C<DANE-EE(3) SPKI(1) SHA2-256(1)> _sha256(pubkey)_
+
+=item * 3 1 2: i.e. C<DANE-EE(3) SPKI(1) SHA2-512(2)> _sha512(pubkey)_
+
+=back
+
+to remain unchanged across the certificate update.  However, at your discretion,
+C<danebot> also supports worry-free key rollover (as explained above).  You can
+stage a _next_ key that will only replace the _current_ key once the
+appropriate additional TLSA records have been in place long enough for stale
+cached copies of the TLSA records to have expired.  Once the new TLSA records
+have been published for the minimum time, a new certificate chain is obtained
+with the staged _next_ as the new _current_ key.
+
+B<NOTE>: The safety-net is only in place if you create a C<dane-ee> file in the
+lineage-specific C<staging> directory with the expected TLSA record matching
+type(s) and DNS locations.  Otherwise the new key will be used on the next
+renew cycle even if no matching TLSA records have been published.
+
+=head1 FILES
+
+=head2 C</etc/default/danebot>
+
+This configuration file is for overriding some default environment variables
+used by danebot. It's a bash script. The directory varies on different
+operating systems. This file can be in /etc/default, /etc/defaults,
+/usr/local/etc, /usr/pkg/etc, or /opt/local/etc.
+
+=head3 Setting KEYALG and KEYOPTS
+
+For default key rollover parameters, these defaults may be changed in
+C</etc/default/danebot>, example content:
+
+ KEYALG="rsa"
+ # KEYOPTS is an array of "-pkeyopt" option values applicable with the
+ # $KEYALG algorithm.  See the OpenSSL genpkey(1) manpage for details.
+ KEYOPTS=(rsa_keygen_bits:2048)
+
+L<[OpenSSL 1.1.1]|https://www.openssl.org/docs/man1.1.1/man1/genpkey.html>
+
+L<[OpenSSL 3.0]|https://www.openssl.org/docs/man3.0/man1/genpkey.html>
+
+=head3 Specifying the TTL
+
+ # Minimum time to wait before assuming that fresh TLSA RRs are globally visible
+ # (expired from all remote caches, and updated on all secondary nameservers).
+ #
+ # This value is passed to find(1) as a "-mtime" option.  The default unit is
+ # days.  The FreeBSD version of find(1) supports explicit units ([smhdw]).
+
+ TTL=2
+
+=head3 Specifying a validating resolver
+
+Specify the IP address of (an ideally local) trusted validating DNS
+resolver:
+
+ NS=127.0.0.1
+
+This is used to check the presence of required TLSA records.  Best to avoid
+remote DNS servers (e.g. the various public DNS services), since the network
+path to these servers is likely insecure.
+
+=head2 C</etc/letsencrypt/staging/*/dane-ee>
+
+This file must list one line per monitored TLSA record set.  Each line has
+two fields, a DANE matching type and a DNS FQDN where the TLSA record is
+expected to be found.  Example:
+
+ 1 _25._tcp.smtp.acme.example
+
+On some operating systems, this is under /usr/local/etc/letsencrypt.
+See above for more details.
+
+=head2 C</etc/letsencrypt/staging/*/dnsnames>
+
+You can require that the Let's Encrypt issued certificate have a set of
+expected DNS names with this file. List one DNS name per line.
+
+On some operating systems, this is under /usr/local/etc/letsencrypt.
+See above for more details.
+
+=head1 SEE ALSO
+
+L<certbot(1)>, L<openssl(1)>.
+
+=head1 AUTHOR
+
+Copyright (C) 2022 Viktor Dukhovni <ietf-dane@dukhovni.org>
+
+=head1 URL
+
+L<[danebot]|https://github.com/tlsaware/danebot>
+
+=cut 

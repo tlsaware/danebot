@@ -56,10 +56,14 @@ TTL=2
 NS=127.0.0.1
 ## --------------
 
-# allow replacement configuration by a user
-if [[ -f /etc/default/danebot ]] ; then
-    . /etc/default/danebot
-fi
+# Allow replacement configuration by a user
+# Choices for Linux/Solaris, FreeBSD/macOS, OpenBSD, NetBSD, macports
+for defaults in /etc/default /etc/defaults /usr/local/etc /usr/pkg/etc /opt/local/etc
+do
+    if [[ -f $defaults/danebot ]] ; then
+        . $defaults/danebot
+    fi
+done
 
 # Avoid charset issues
 export LANG=C LC_ALL=C LC_CTYPE=C IDN_DISABLE=1

@@ -33,6 +33,22 @@ fi
 KEYALG="rsa"
 KEYOPTS=(rsa_keygen_bits:2048)
 
+# ADVANCED: The file permissions of the "combo.pem" chain + key file.
+# When in doubt, leave the default in place.
+#
+# When, for example, the top-level "/etc/letsencrypt" directory is
+# read-protected (file mode 0700), while the "live" subdirectory is not (file
+# mode 0755) it is possible for a process to drop privileges after entering the
+# "live" directory, and be able to open updated "combo" chain+key files without
+# a restart, provided those files are also world-readable (mode 0644).
+#
+# You have to set up the directory permissions yourself, "danebot" only sets
+# the permissions of the "combo.pem" file.
+#
+# It is NOT safe to make the files world readable without protecting the
+# ancestor /etc/letencrypt (or platform's equivalent) directory.
+KEYMODE=0600
+
 # QUESTION: why can't these be read from the current cert as a default?
 
 # Minimum time to wait before assuming that fresh TLSA RRs are globally visible
@@ -89,12 +105,12 @@ creq2pub() {
 }
 chainder() {
     openssl crl2pkcs7 -nocrl -certfile "$1" |
-    openssl pkcs7 -outform DER
+	openssl pkcs7 -outform DER
     checkpipe
 }
 chainpem() {
     openssl crl2pkcs7 -nocrl -certfile "$1" |
-    openssl pkcs7 -print_certs
+	openssl pkcs7 -print_certs
     checkpipe
 }
 
@@ -430,7 +446,11 @@ freshen() {
 
     if [[ "$move" == 0 ]]; then
         /bin/rm -f "$combo"
+        # Update permissions, if stale
+        find "$d/combo.pem" -type d -prune -o -type f ! -perm "${KEYMODE}" \
+            -exec chmod "${KEYMODE}" "{}" ";"
     else
+        chmod "${KEYMODE}" "$combo"
         mv "$combo" "$d/combo.pem"
         checkpipe || {
             printf "error staging combo key+chain for lineage: %s\n" "$l" >&2
